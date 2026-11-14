@@ -53,6 +53,12 @@ CREATE TABLE IF NOT EXISTS schedule(
   title TEXT NOT NULL, planned_date TEXT NOT NULL, note TEXT,
   status TEXT NOT NULL DEFAULT 'planned', created_at TEXT DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS sched_files(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  schedule_id INTEGER NOT NULL REFERENCES schedule(id) ON DELETE CASCADE,
+  orig_name TEXT NOT NULL, stored_name TEXT NOT NULL,
+  size INTEGER, mime TEXT, created_at TEXT DEFAULT (datetime('now'))
+);
 `);
 db.pragma("foreign_keys = ON");
 
@@ -269,6 +275,7 @@ app.get("/channels/:id", requireAuth, (req, res) => {
   sql += " ORDER BY " + sortKey;
   const items = db.prepare(sql).all(...args);
   const sched = db.prepare("SELECT * FROM schedule WHERE channel_id=? ORDER BY (status='done') ASC, planned_date ASC").all(c.id);
+  const sfilesFor = db.prepare("SELECT * FROM sched_files WHERE schedule_id=?");
   const today = new Date().toISOString().slice(0, 10);
   const fileRows = db.prepare("SELECT * FROM files WHERE item_id=?");
 
@@ -290,7 +297,7 @@ app.get("/channels/:id", requireAuth, (req, res) => {
           const overdue = sc.status === "planned" && sc.planned_date < today;
           return `<tr style="${sc.status === "done" ? "opacity:.45" : ""}">
             <td style="white-space:nowrap;${overdue ? "color:#f88;font-weight:600" : ""}">${esc(sc.planned_date)}${overdue ? " &#9888;" : ""}</td>
-            <td>${sc.status === "done" ? "<s>" + esc(sc.title) + "</s>" : esc(sc.title)}</td>
+            <td>${sc.status === "done" ? "<s>" + esc(sc.title) + "</s>" : esc(sc.title)}${sfilesFor.all(sc.id).map(f => `<div class="file" style="margin-top:4px">&#128206; <a href="/sfiles/${f.id}/download">${esc(f.orig_name)}</a> <span class="mut">${fmtSize(f.size)}</span></div>`).join("")}</td>
             <td class="mut">${esc(sc.note || "")}</td>
             <td><form method="post" action="/schedule/${sc.id}/done" style="margin:0"><button class="sec" style="padding:4px 10px;font-size:12px">${sc.status === "done" ? "Undo" : "Done"}</button></form></td>
             <td><form method="post" action="/schedule/${sc.id}/delete" style="margin:0" onsubmit="return confirm('Delete this entry?')"><button class="danger">&#10005;</button></form></td>
@@ -298,10 +305,11 @@ app.get("/channels/:id", requireAuth, (req, res) => {
         }).join("")}
       </table>`}
       <details><summary>+ Add to schedule</summary>
-        <form method="post" action="/channels/${c.id}/schedule" class="row" style="align-items:flex-end">
+        <form method="post" action="/channels/${c.id}/schedule" enctype="multipart/form-data" class="row" style="align-items:flex-end">
           <div><label>Date</label><input type="date" name="planned_date" required style="margin:6px 0 0"></div>
           <div style="flex:1;min-width:180px"><label>Title</label><input name="title" placeholder="e.g. Wheels on the Bus" required style="margin:6px 0 0"></div>
           <div style="flex:1;min-width:140px"><label>Note (optional)</label><input name="note" style="margin:6px 0 0"></div>
+          <div style="flex:1;min-width:180px"><label>Files (PDF, audio, anything)</label><input type="file" name="files" multiple style="margin:6px 0 0"></div>
           <button>Add</button>
         </form>
         <form method="post" action="/channels/${c.id}/schedule/bulk">
@@ -339,7 +347,7 @@ app.get("/channels/:id", requireAuth, (req, res) => {
           <datalist id="cats">${DEFAULT_CATS.map(d => `<option value="${d}">`).join("")}</datalist>
           <label>Title</label><input name="title" placeholder="e.g. Baby Doo character sheet" required>
           <label>Text (script, lyrics, notes — optional)</label><textarea name="body"></textarea>
-          <label>Files (optional, up to 10 — stored exactly as uploaded)</label>
+          <label>Files (optional, up to 10 — PDF, audio, video, images, anything; stored exactly as uploaded)</label>
           <input type="file" name="files" multiple>
           <button>Save item</button>
         </form>
@@ -388,12 +396,16 @@ app.post("/items/:id/delete", requireAuth, (req, res) => {
 
 // ---------- schedule ----------
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-app.post("/channels/:id/schedule", requireAuth, (req, res) => {
+app.post("/channels/:id/schedule", requireAuth, upload.array("files", 10), (req, res) => {
   const c = db.prepare("SELECT id FROM channels WHERE id=?").get(req.params.id);
   const { planned_date, title, note } = req.body;
   if (c && title && DATE_RE.test(planned_date || "")) {
-    db.prepare("INSERT INTO schedule(channel_id,title,planned_date,note) VALUES(?,?,?,?)")
+    const r = db.prepare("INSERT INTO schedule(channel_id,title,planned_date,note) VALUES(?,?,?,?)")
       .run(c.id, title.trim(), planned_date, (note || "").trim());
+    for (const f of req.files || []) {
+      db.prepare("INSERT INTO sched_files(schedule_id,orig_name,stored_name,size,mime) VALUES(?,?,?,?,?)")
+        .run(r.lastInsertRowid, f.originalname, f.filename, f.size, f.mimetype);
+    }
   }
   res.redirect("/channels/" + req.params.id);
 });
@@ -415,8 +427,20 @@ app.post("/schedule/:id/done", requireAuth, (req, res) => {
 });
 app.post("/schedule/:id/delete", requireAuth, (req, res) => {
   const sc = db.prepare("SELECT channel_id FROM schedule WHERE id=?").get(req.params.id);
-  if (sc) db.prepare("DELETE FROM schedule WHERE id=?").run(req.params.id);
+  if (sc) {
+    const fls = db.prepare("SELECT stored_name FROM sched_files WHERE schedule_id=?").all(req.params.id);
+    db.prepare("DELETE FROM schedule WHERE id=?").run(req.params.id);
+    for (const f of fls) { try { fs.unlinkSync(path.join(UPLOAD_DIR, f.stored_name)); } catch {} }
+  }
   res.redirect("/channels/" + (sc ? sc.channel_id : ""));
+});
+
+app.get("/sfiles/:id/download", requireAuth, (req, res) => {
+  const f = db.prepare("SELECT * FROM sched_files WHERE id=?").get(req.params.id);
+  if (!f) return res.status(404).send("Not found");
+  const p = path.join(UPLOAD_DIR, path.basename(f.stored_name));
+  if (!fs.existsSync(p)) return res.status(404).send("File missing on disk");
+  res.download(p, f.orig_name);
 });
 
 // ---------- original-quality download ----------
