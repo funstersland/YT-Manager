@@ -47,12 +47,18 @@ CREATE TABLE IF NOT EXISTS files(
   orig_name TEXT NOT NULL, stored_name TEXT NOT NULL,
   size INTEGER, mime TEXT, created_at TEXT DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS schedule(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  title TEXT NOT NULL, planned_date TEXT NOT NULL, note TEXT,
+  status TEXT NOT NULL DEFAULT 'planned', created_at TEXT DEFAULT (datetime('now'))
+);
 `);
 db.pragma("foreign_keys = ON");
 
 // ---------- app ----------
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" })); // big bulk pastes welcome
 app.use(cookieSession({
   name: "ytm",
   secret: SECRET,
@@ -259,8 +265,11 @@ app.get("/channels/:id", requireAuth, (req, res) => {
   let sql = "SELECT * FROM items WHERE channel_id=?", args = [c.id];
   if (active) { sql += " AND category=?"; args.push(active); }
   if (q) { sql += " AND (title LIKE ? OR body LIKE ?)"; args.push(`%${q}%`, `%${q}%`); }
-  sql += " ORDER BY created_at DESC";
+  const sortKey = { new: "created_at DESC", old: "created_at ASC", title: "title COLLATE NOCASE ASC", cat: "category COLLATE NOCASE ASC, created_at DESC" }[req.query.sort] || "created_at DESC";
+  sql += " ORDER BY " + sortKey;
   const items = db.prepare(sql).all(...args);
+  const sched = db.prepare("SELECT * FROM schedule WHERE channel_id=? ORDER BY (status='done') ASC, planned_date ASC").all(c.id);
+  const today = new Date().toISOString().slice(0, 10);
   const fileRows = db.prepare("SELECT * FROM files WHERE item_id=?");
 
   res.send(page(c.name, `
@@ -273,6 +282,38 @@ app.get("/channels/:id", requireAuth, (req, res) => {
       ${u.role === "owner" ? `<form method="post" action="/channels/${c.id}/delete" onsubmit="return confirm('Delete this channel and ALL its items & files?')"><button class="danger">Delete channel</button></form>` : ""}
     </div>
 
+    <h2>&#128197; Upcoming schedule</h2>
+    <div class="card">
+      ${sched.length === 0 ? `<p class="mut">Nothing planned yet.</p>` : `<table>
+        <tr><th>Date</th><th>Title</th><th>Note</th><th></th><th></th></tr>
+        ${sched.map(sc => {
+          const overdue = sc.status === "planned" && sc.planned_date < today;
+          return `<tr style="${sc.status === "done" ? "opacity:.45" : ""}">
+            <td style="white-space:nowrap;${overdue ? "color:#f88;font-weight:600" : ""}">${esc(sc.planned_date)}${overdue ? " &#9888;" : ""}</td>
+            <td>${sc.status === "done" ? "<s>" + esc(sc.title) + "</s>" : esc(sc.title)}</td>
+            <td class="mut">${esc(sc.note || "")}</td>
+            <td><form method="post" action="/schedule/${sc.id}/done" style="margin:0"><button class="sec" style="padding:4px 10px;font-size:12px">${sc.status === "done" ? "Undo" : "Done"}</button></form></td>
+            <td><form method="post" action="/schedule/${sc.id}/delete" style="margin:0" onsubmit="return confirm('Delete this entry?')"><button class="danger">&#10005;</button></form></td>
+          </tr>`;
+        }).join("")}
+      </table>`}
+      <details><summary>+ Add to schedule</summary>
+        <form method="post" action="/channels/${c.id}/schedule" class="row" style="align-items:flex-end">
+          <div><label>Date</label><input type="date" name="planned_date" required style="margin:6px 0 0"></div>
+          <div style="flex:1;min-width:180px"><label>Title</label><input name="title" placeholder="e.g. Wheels on the Bus" required style="margin:6px 0 0"></div>
+          <div style="flex:1;min-width:140px"><label>Note (optional)</label><input name="note" style="margin:6px 0 0"></div>
+          <button>Add</button>
+        </form>
+        <form method="post" action="/channels/${c.id}/schedule/bulk">
+          <label>Bulk add &mdash; one per line: <code>YYYY-MM-DD | Title | optional note</code></label>
+          <textarea name="lines" placeholder="2026-11-20 | Wheels on the Bus
+2026-11-24 | ABC Song | with Didi"></textarea>
+          <button class="sec">Add all</button>
+        </form>
+      </details>
+    </div>
+
+    <h2>&#128230; Stored items</h2>
     <div class="tabs">
       <a href="/channels/${c.id}" class="${!active ? "on" : ""}">All</a>
       ${allCats.map(cat => `<a href="/channels/${c.id}?cat=${encodeURIComponent(cat)}" class="${active === cat ? "on" : ""}">${esc(cat)}</a>`).join("")}
@@ -281,7 +322,13 @@ app.get("/channels/:id", requireAuth, (req, res) => {
     <form method="get" action="/channels/${c.id}" class="row" style="margin-top:8px">
       ${active ? `<input type="hidden" name="cat" value="${esc(active)}">` : ""}
       <input name="q" value="${esc(q)}" placeholder="Search titles & text…" style="max-width:320px;margin:0">
-      <button class="sec">Search</button>
+      <select name="sort" style="max-width:160px;margin:0">
+        <option value="new" ${req.query.sort === "old" || req.query.sort === "title" || req.query.sort === "cat" ? "" : "selected"}>Newest first</option>
+        <option value="old" ${req.query.sort === "old" ? "selected" : ""}>Oldest first</option>
+        <option value="title" ${req.query.sort === "title" ? "selected" : ""}>Title A&ndash;Z</option>
+        <option value="cat" ${req.query.sort === "cat" ? "selected" : ""}>Category</option>
+      </select>
+      <button class="sec">Apply</button>
     </form>
 
     <details><summary>+ Add item (text, files, or both)</summary>
@@ -337,6 +384,39 @@ app.post("/items/:id/delete", requireAuth, (req, res) => {
   db.prepare("DELETE FROM items WHERE id=?").run(it.id);
   for (const f of fls) { try { fs.unlinkSync(path.join(UPLOAD_DIR, f.stored_name)); } catch {} }
   res.redirect("/channels/" + it.channel_id);
+});
+
+// ---------- schedule ----------
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+app.post("/channels/:id/schedule", requireAuth, (req, res) => {
+  const c = db.prepare("SELECT id FROM channels WHERE id=?").get(req.params.id);
+  const { planned_date, title, note } = req.body;
+  if (c && title && DATE_RE.test(planned_date || "")) {
+    db.prepare("INSERT INTO schedule(channel_id,title,planned_date,note) VALUES(?,?,?,?)")
+      .run(c.id, title.trim(), planned_date, (note || "").trim());
+  }
+  res.redirect("/channels/" + req.params.id);
+});
+app.post("/channels/:id/schedule/bulk", requireAuth, (req, res) => {
+  const c = db.prepare("SELECT id FROM channels WHERE id=?").get(req.params.id);
+  if (c) {
+    const ins = db.prepare("INSERT INTO schedule(channel_id,title,planned_date,note) VALUES(?,?,?,?)");
+    for (const line of (req.body.lines || "").split(/\r?\n/)) {
+      const parts = line.split("|").map(p => p.trim());
+      if (parts.length >= 2 && DATE_RE.test(parts[0]) && parts[1]) ins.run(c.id, parts[1], parts[0], parts[2] || "");
+    }
+  }
+  res.redirect("/channels/" + req.params.id);
+});
+app.post("/schedule/:id/done", requireAuth, (req, res) => {
+  const sc = db.prepare("SELECT * FROM schedule WHERE id=?").get(req.params.id);
+  if (sc) db.prepare("UPDATE schedule SET status=? WHERE id=?").run(sc.status === "done" ? "planned" : "done", sc.id);
+  res.redirect("/channels/" + (sc ? sc.channel_id : ""));
+});
+app.post("/schedule/:id/delete", requireAuth, (req, res) => {
+  const sc = db.prepare("SELECT channel_id FROM schedule WHERE id=?").get(req.params.id);
+  if (sc) db.prepare("DELETE FROM schedule WHERE id=?").run(req.params.id);
+  res.redirect("/channels/" + (sc ? sc.channel_id : ""));
 });
 
 // ---------- original-quality download ----------
