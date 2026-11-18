@@ -12,6 +12,12 @@ const crypto = require("crypto");
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const TMP_DIR = path.join(DATA_DIR, "tmp");
+fs.mkdirSync(TMP_DIR, { recursive: true });
+// clear half-finished chunked uploads older than 2 days
+for (const f of fs.readdirSync(TMP_DIR)) {
+  try { const p = path.join(TMP_DIR, f); if (Date.now() - fs.statSync(p).mtimeMs > 2 * 86400000) fs.unlinkSync(p); } catch {}
+}
 
 // ---------- session secret (persisted) ----------
 const secretFile = path.join(DATA_DIR, ".secret");
@@ -78,7 +84,7 @@ const upload = multer({
     destination: UPLOAD_DIR,
     filename: (req, file, cb) => cb(null, Date.now() + "-" + crypto.randomBytes(6).toString("hex")),
   }),
-  limits: { fileSize: 1024 * 1024 * 1024 }, // 1 GB per file
+  // no size limit: big files go through the chunked uploader below
 });
 
 const userCount = () => db.prepare("SELECT COUNT(*) c FROM users").get().c;
@@ -87,6 +93,10 @@ const me = (req) => (req.session.uid ? db.prepare("SELECT * FROM users WHERE id=
 function requireAuth(req, res, next) {
   if (userCount() === 0) return res.redirect("/setup");
   if (!me(req)) return res.redirect("/");
+  next();
+}
+function requireAuthApi(req, res, next) {
+  if (!me(req)) return res.status(401).json({ error: "Not logged in" });
   next();
 }
 function requireOwner(req, res, next) {
@@ -155,6 +165,67 @@ details summary{cursor:pointer;color:var(--accent);font-size:14px;margin:14px 0 
 </header>
 ${body}
 <footer>YT Manager · a Quantumines tool · files stored & downloaded in original quality</footer>
+<script>
+(function(){
+  var CHUNK = 20 * 1024 * 1024;
+  function newId(){ var a = new Uint8Array(16); (window.crypto||window.msCrypto).getRandomValues(a); return Array.from(a, function(b){return b.toString(16).padStart(2,"0");}).join(""); }
+  function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+  async function upFile(file, kind, id, onp){
+    var uid = newId(), off = 0, fails = 0;
+    while (off < file.size) {
+      var blob = file.slice(off, off + CHUNK);
+      try {
+        var r = await fetch("/api/upload/" + uid + "/chunk?offset=" + off, { method: "POST", body: blob, headers: { "Content-Type": "application/octet-stream" } });
+        if (r.ok) { off += blob.size; fails = 0; onp(off / file.size); continue; }
+        if (r.status === 409) { var j = await r.json(); off = j.size; continue; }
+        if (r.status === 401) throw new Error("logged out — log in again");
+        throw new Error("server said " + r.status);
+      } catch (e) {
+        if (/logged out/.test(e.message)) throw e;
+        fails++;
+        if (fails > 8) throw new Error("connection keeps failing (" + e.message + ")");
+        await sleep(1500 * fails);
+        try { var s = await fetch("/api/upload/" + uid + "/chunk?offset=-1", { method: "POST", body: new Blob([]) }); if (s.status === 409) { off = (await s.json()).size; } } catch (e2) {}
+      }
+    }
+    if (file.size === 0) await fetch("/api/upload/" + uid + "/chunk?offset=0", { method: "POST", body: new Blob([]) });
+    var fr = await fetch("/api/upload/" + uid + "/finish", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: kind, id: id, name: file.name, mime: file.type, size: file.size }) });
+    if (!fr.ok) throw new Error("could not finish " + file.name);
+  }
+  document.querySelectorAll("form[data-chunk]").forEach(function(f){
+    f.addEventListener("submit", async function(e){
+      var fi = f.querySelector("input[type=file]");
+      var files = fi && fi.files ? Array.from(fi.files) : [];
+      if (!files.length) return;
+      e.preventDefault();
+      var kind = f.dataset.chunk, id = f.dataset.id, redirect = location.pathname + location.search;
+      var status = f.querySelector(".up-status");
+      if (!status) { status = document.createElement("div"); status.className = "mut up-status"; status.style.marginTop = "8px"; f.appendChild(status); }
+      var btns = f.querySelectorAll("button"); btns.forEach(function(b){ b.disabled = true; });
+      try {
+        if (!id) {
+          var fd = new FormData(f); fd.delete("files");
+          var r = await fetch(f.action, { method: "POST", body: fd, headers: { "X-Requested-With": "fetch" } });
+          var j = await r.json();
+          if (!r.ok || !j.id) throw new Error(j.error || "could not save");
+          id = j.id; redirect = j.redirect || redirect;
+          f.dataset.id = id;
+        }
+        for (var i = 0; i < files.length; i++) {
+          var fl = files[i];
+          await upFile(fl, kind, id, function(p){ status.textContent = "Uploading " + fl.name + " (" + (i + 1) + "/" + files.length + "): " + Math.floor(p * 100) + "%"; });
+        }
+        status.textContent = "All files uploaded.";
+        location.href = redirect;
+      } catch (err) {
+        status.textContent = "Upload stopped: " + err.message + ". Press the button again to retry.";
+        btns.forEach(function(b){ b.disabled = false; });
+      }
+    });
+  });
+})();
+</script>
 </body></html>`;
 }
 
@@ -305,7 +376,7 @@ app.get("/channels/:id", requireAuth, (req, res) => {
         }).join("")}
       </table>`}
       <details><summary>+ Add to schedule</summary>
-        <form method="post" action="/channels/${c.id}/schedule" enctype="multipart/form-data" class="row" style="align-items:flex-end">
+        <form method="post" action="/channels/${c.id}/schedule" enctype="multipart/form-data" class="row" style="align-items:flex-end" data-chunk="sched">
           <div><label>Date</label><input type="date" name="planned_date" required style="margin:6px 0 0"></div>
           <div style="flex:1;min-width:180px"><label>Title</label><input name="title" placeholder="e.g. Wheels on the Bus" required style="margin:6px 0 0"></div>
           <div style="flex:1;min-width:140px"><label>Note (optional)</label><input name="note" style="margin:6px 0 0"></div>
@@ -341,13 +412,13 @@ app.get("/channels/:id", requireAuth, (req, res) => {
 
     <details><summary>+ Add item (text, files, or both)</summary>
       <div class="card" style="max-width:560px">
-        <form method="post" action="/channels/${c.id}/items" enctype="multipart/form-data">
+        <form method="post" action="/channels/${c.id}/items" enctype="multipart/form-data" data-chunk="item">
           <label>Category</label>
           <input name="category" list="cats" value="${esc(active)}" placeholder="Characters / Scripts / Sounds / …" required>
           <datalist id="cats">${DEFAULT_CATS.map(d => `<option value="${d}">`).join("")}</datalist>
           <label>Title</label><input name="title" placeholder="e.g. Baby Doo character sheet" required>
           <label>Text (script, lyrics, notes — optional)</label><textarea name="body"></textarea>
-          <label>Files (optional, up to 10 — PDF, audio, video, images, anything; stored exactly as uploaded)</label>
+          <label>Files (optional — PDF, audio, video, images, anything, any size; stored exactly as uploaded)</label>
           <input type="file" name="files" multiple>
           <button>Save item</button>
         </form>
@@ -365,7 +436,7 @@ app.get("/channels/:id", requireAuth, (req, res) => {
         <div class="mut">${esc(it.created_at)} · ${esc(it.created_by || "")}</div>
         ${it.body ? `<div class="body">${esc(it.body)}</div>` : ""}
         ${fls.map(f => `<div class="file">📎 <a href="/files/${f.id}/download">${esc(f.orig_name)}</a> <span class="mut">${fmtSize(f.size)}</span></div>`).join("")}
-        <form method="post" action="/items/${it.id}/files" enctype="multipart/form-data" class="row" style="margin-top:10px">
+        <form method="post" action="/items/${it.id}/files" enctype="multipart/form-data" class="row" style="margin-top:10px" data-chunk="item" data-id="${it.id}">
           <input type="file" name="files" multiple style="max-width:320px;margin:0">
           <button class="sec" style="padding:6px 12px;font-size:12px">Add files</button>
         </form>
@@ -386,7 +457,9 @@ app.post("/channels/:id/items", requireAuth, upload.array("files", 10), (req, re
     db.prepare("INSERT INTO files(item_id,orig_name,stored_name,size,mime) VALUES(?,?,?,?,?)")
       .run(r.lastInsertRowid, f.originalname, f.filename, f.size, f.mimetype);
   }
-  res.redirect(`/channels/${c.id}?cat=${encodeURIComponent(category.trim())}`);
+  const redirect = `/channels/${c.id}?cat=${encodeURIComponent(category.trim())}`;
+  if (req.get("X-Requested-With") === "fetch") return res.json({ id: Number(r.lastInsertRowid), redirect });
+  res.redirect(redirect);
 });
 
 app.post("/items/:id/files", requireAuth, upload.array("files", 10), (req, res) => {
@@ -416,14 +489,17 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 app.post("/channels/:id/schedule", requireAuth, upload.array("files", 10), (req, res) => {
   const c = db.prepare("SELECT id FROM channels WHERE id=?").get(req.params.id);
   const { planned_date, title, note } = req.body;
+  let newId = null;
   if (c && title && DATE_RE.test(planned_date || "")) {
     const r = db.prepare("INSERT INTO schedule(channel_id,title,planned_date,note) VALUES(?,?,?,?)")
       .run(c.id, title.trim(), planned_date, (note || "").trim());
+    newId = Number(r.lastInsertRowid);
     for (const f of req.files || []) {
       db.prepare("INSERT INTO sched_files(schedule_id,orig_name,stored_name,size,mime) VALUES(?,?,?,?,?)")
         .run(r.lastInsertRowid, f.originalname, f.filename, f.size, f.mimetype);
     }
   }
+  if (req.get("X-Requested-With") === "fetch") return newId ? res.json({ id: newId, redirect: "/channels/" + req.params.id }) : res.status(400).json({ error: "Date and title are required" });
   res.redirect("/channels/" + req.params.id);
 });
 app.post("/channels/:id/schedule/bulk", requireAuth, (req, res) => {
@@ -458,6 +534,39 @@ app.get("/sfiles/:id/download", requireAuth, (req, res) => {
   const p = path.join(UPLOAD_DIR, path.basename(f.stored_name));
   if (!fs.existsSync(p)) return res.status(404).send("File missing on disk");
   res.download(p, f.orig_name);
+});
+
+// ---------- chunked uploads (unlimited file size) ----------
+const UID_RE = /^[a-f0-9]{16,64}$/;
+app.post("/api/upload/:uid/chunk", requireAuthApi, express.raw({ type: () => true, limit: "64mb" }), (req, res) => {
+  const uid = req.params.uid;
+  if (!UID_RE.test(uid)) return res.status(400).json({ error: "bad upload id" });
+  const p = path.join(TMP_DIR, uid);
+  const have = fs.existsSync(p) ? fs.statSync(p).size : 0;
+  const offset = Number(req.query.offset);
+  if (!Number.isFinite(offset) || offset !== have) return res.status(409).json({ size: have });
+  fs.appendFileSync(p, req.body || Buffer.alloc(0));
+  res.json({ size: fs.statSync(p).size });
+});
+app.post("/api/upload/:uid/finish", requireAuthApi, express.json(), (req, res) => {
+  const uid = req.params.uid;
+  const { kind, id, name, mime, size } = req.body || {};
+  if (!UID_RE.test(uid)) return res.status(400).json({ error: "bad upload id" });
+  const p = path.join(TMP_DIR, uid);
+  if (!fs.existsSync(p)) return res.status(404).json({ error: "upload not found" });
+  const got = fs.statSync(p).size;
+  if (got !== Number(size)) return res.status(409).json({ error: "size mismatch", size: got });
+  const table = kind === "sched" ? "sched_files" : "files";
+  const col = kind === "sched" ? "schedule_id" : "item_id";
+  const parent = kind === "sched"
+    ? db.prepare("SELECT id FROM schedule WHERE id=?").get(id)
+    : db.prepare("SELECT id FROM items WHERE id=?").get(id);
+  if (!parent) { try { fs.unlinkSync(p); } catch {} return res.status(404).json({ error: "target not found" }); }
+  const stored = Date.now() + "-" + crypto.randomBytes(6).toString("hex");
+  fs.renameSync(p, path.join(UPLOAD_DIR, stored));
+  db.prepare(`INSERT INTO ${table}(${col},orig_name,stored_name,size,mime) VALUES(?,?,?,?,?)`)
+    .run(parent.id, String(name || "file").slice(0, 300), stored, got, String(mime || "application/octet-stream"));
+  res.json({ ok: true });
 });
 
 // ---------- original-quality download ----------
@@ -515,4 +624,6 @@ app.post("/users/:id/delete", requireAuth, requireOwner, (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("YT Manager running on port " + PORT));
+const server = app.listen(PORT, () => console.log("YT Manager running on port " + PORT));
+server.requestTimeout = 0;   // long uploads/downloads never get cut by Node
+server.timeout = 0;
