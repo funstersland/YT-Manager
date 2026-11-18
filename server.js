@@ -365,6 +365,10 @@ app.get("/channels/:id", requireAuth, (req, res) => {
         <div class="mut">${esc(it.created_at)} · ${esc(it.created_by || "")}</div>
         ${it.body ? `<div class="body">${esc(it.body)}</div>` : ""}
         ${fls.map(f => `<div class="file">📎 <a href="/files/${f.id}/download">${esc(f.orig_name)}</a> <span class="mut">${fmtSize(f.size)}</span></div>`).join("")}
+        <form method="post" action="/items/${it.id}/files" enctype="multipart/form-data" class="row" style="margin-top:10px">
+          <input type="file" name="files" multiple style="max-width:320px;margin:0">
+          <button class="sec" style="padding:6px 12px;font-size:12px">Add files</button>
+        </form>
       </div>`;
     }).join("")}
   </div>`, u));
@@ -383,6 +387,19 @@ app.post("/channels/:id/items", requireAuth, upload.array("files", 10), (req, re
       .run(r.lastInsertRowid, f.originalname, f.filename, f.size, f.mimetype);
   }
   res.redirect(`/channels/${c.id}?cat=${encodeURIComponent(category.trim())}`);
+});
+
+app.post("/items/:id/files", requireAuth, upload.array("files", 10), (req, res) => {
+  const it = db.prepare("SELECT * FROM items WHERE id=?").get(req.params.id);
+  if (!it) {
+    for (const f of req.files || []) { try { fs.unlinkSync(f.path); } catch {} }
+    return res.redirect("/dashboard");
+  }
+  for (const f of req.files || []) {
+    db.prepare("INSERT INTO files(item_id,orig_name,stored_name,size,mime) VALUES(?,?,?,?,?)")
+      .run(it.id, f.originalname, f.filename, f.size, f.mimetype);
+  }
+  res.redirect(`/channels/${it.channel_id}?cat=${encodeURIComponent(it.category)}`);
 });
 
 app.post("/items/:id/delete", requireAuth, (req, res) => {
